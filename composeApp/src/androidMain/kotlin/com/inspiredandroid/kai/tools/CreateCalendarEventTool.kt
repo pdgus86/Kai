@@ -62,7 +62,9 @@ object CreateCalendarEventTool {
                     "event_id" to result.eventId,
                     "title" to result.title,
                     "scheduled_for" to result.startTime,
-                    "message" to "Event '${result.title}' created successfully for ${result.startTime}",
+                    "calendar" to result.calendarName,
+                    "account" to result.accountName,
+                    "message" to "Event '${result.title}' created successfully for ${result.startTime} in calendar '${result.calendarName}' (${result.accountName})",
                 )
 
                 is CalendarResult.Error -> mapOf(

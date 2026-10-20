@@ -18,7 +18,13 @@ import java.util.TimeZone
 private const val TAG = "CalendarRepository"
 
 sealed class CalendarResult {
-    data class Success(val eventId: Long, val title: String, val startTime: String) : CalendarResult()
+    data class Success(
+        val eventId: Long,
+        val title: String,
+        val startTime: String,
+        val calendarName: String = "",
+        val accountName: String = "",
+    ) : CalendarResult()
     data class Error(val message: String) : CalendarResult()
 }
 
@@ -39,32 +45,61 @@ class CalendarRepository(
         return hasRead && hasWrite
     }
 
-    fun getPrimaryCalendarId(): Long? {
+    data class TargetCalendar(val id: Long, val displayName: String, val accountName: String)
+
+    /**
+     * Picks the calendar to write to. Prefers a visible, synced Google calendar
+     * (the primary one first), then any visible synced writable calendar, then any
+     * writable calendar. The old logic took the first writable calendar, which on
+     * Samsung devices is often a hidden or local-only calendar.
+     */
+    fun getTargetCalendar(): TargetCalendar? {
         val projection = arrayOf(
             CalendarContract.Calendars._ID,
-            CalendarContract.Calendars.CALENDAR_ACCESS_LEVEL,
+            CalendarContract.Calendars.ACCOUNT_TYPE,
+            CalendarContract.Calendars.ACCOUNT_NAME,
+            CalendarContract.Calendars.CALENDAR_DISPLAY_NAME,
             CalendarContract.Calendars.IS_PRIMARY,
+            CalendarContract.Calendars.VISIBLE,
+            CalendarContract.Calendars.SYNC_EVENTS,
         )
-
         val selection = "${CalendarContract.Calendars.CALENDAR_ACCESS_LEVEL} >= ?"
         val selectionArgs = arrayOf(CalendarContract.Calendars.CAL_ACCESS_CONTRIBUTOR.toString())
 
+        var best: TargetCalendar? = null
+        var bestScore = -1
         context.contentResolver.query(
             CalendarContract.Calendars.CONTENT_URI,
             projection,
             selection,
             selectionArgs,
-            "${CalendarContract.Calendars.IS_PRIMARY} DESC",
-        )?.use { cursor ->
-            if (cursor.moveToFirst()) {
-                val idIndex = cursor.getColumnIndex(CalendarContract.Calendars._ID)
-                if (idIndex >= 0) {
-                    return cursor.getLong(idIndex)
+            null,
+        )?.use { c ->
+            while (c.moveToNext()) {
+                val id = c.getLong(0)
+                val type = c.getString(1)
+                val account = c.getString(2) ?: ""
+                val name = c.getString(3) ?: account
+                val primary = !c.isNull(4) && c.getInt(4) == 1
+                val visible = !c.isNull(5) && c.getInt(5) == 1
+                val synced = !c.isNull(6) && c.getInt(6) == 1
+                val isGoogle = type == "com.google"
+                var score = 0
+                if (visible) score += 8
+                if (synced) score += 4
+                if (isGoogle) score += 2
+                if (primary || (isGoogle && name.equals(account, ignoreCase = true))) score += 1
+                Log.d(TAG, "Calendar candidate id=$id name=$name account=$account type=$type score=$score")
+                if (score > bestScore) {
+                    bestScore = score
+                    best = TargetCalendar(id, name, account)
                 }
             }
         }
-        return null
+        return best
     }
+
+    fun getPrimaryCalendarId(): Long? = getTargetCalendar()?.id
 
     suspend fun createEvent(
         title: String,
@@ -89,7 +124,7 @@ class CalendarRepository(
             Log.d(TAG, "Permission already granted")
         }
 
-        val calendarId = getPrimaryCalendarId()
+        val target = getTargetCalendar()
             ?: return CalendarResult.Error("No writable calendar found. Please set up a calendar account on your device.")
 
         val startMillis: Long
@@ -109,7 +144,7 @@ class CalendarRepository(
         }
 
         val values = ContentValues().apply {
-            put(CalendarContract.Events.CALENDAR_ID, calendarId)
+            put(CalendarContract.Events.CALENDAR_ID, target.id)
             put(CalendarContract.Events.TITLE, title)
             put(CalendarContract.Events.DTSTART, startMillis)
             put(CalendarContract.Events.DTEND, endMillis)
@@ -130,7 +165,7 @@ class CalendarRepository(
                 }
 
                 val formattedStart = formatForDisplay(startMillis)
-                CalendarResult.Success(eventId, title, formattedStart)
+                CalendarResult.Success(eventId, title, formattedStart, target.displayName, target.accountName)
             } else {
                 CalendarResult.Error("Failed to create calendar event")
             }
